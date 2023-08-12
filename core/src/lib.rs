@@ -1,1 +1,2 @@
+mod console;
 mod emulator;

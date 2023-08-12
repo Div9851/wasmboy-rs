@@ -1,3 +1,4 @@
+use crate::console_log;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -11,6 +12,7 @@ impl Emulator {
     }
 
     pub fn greet(&self, name: &str) -> String {
+        console_log!("Hello, {}!", name);
         format!("Hello, {}!", name)
     }
 }
