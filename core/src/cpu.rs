@@ -1,9 +1,14 @@
 use crate::bus::Bus;
+use crate::consts;
+use crate::context::Context;
 use crate::inst::{self, Inst, JumpCond, Op16, Op8};
 
 pub struct CPU {
     pub bus: Bus,
     pub registers: Registers,
+    pub ctx: Context,
+    pub is_halt: bool,
+    pub prev_ei: bool,
     pub interrupt_master_enable: bool,
     pub tick_count: isize,
     pub inst_table: [Inst; 256],
@@ -15,6 +20,9 @@ impl CPU {
         CPU {
             bus: Bus::new(),
             registers: Registers::default(),
+            ctx: Context::default(),
+            is_halt: false,
+            prev_ei: false,
             interrupt_master_enable: false,
             tick_count: 0,
             inst_table: inst::generate_inst_table(),
@@ -22,22 +30,22 @@ impl CPU {
         }
     }
 
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         self.tick_count += 1;
-        self.bus.tick();
+        self.bus.tick(&mut self.ctx);
     }
 
-    pub fn read(&mut self, addr: u16) -> u8 {
+    fn read(&mut self, addr: u16) -> u8 {
         self.tick();
-        self.bus.read(addr)
+        self.bus.read(&mut self.ctx, addr)
     }
 
-    pub fn write(&mut self, addr: u16, value: u8) {
+    fn write(&mut self, addr: u16, value: u8) {
         self.tick();
-        self.bus.write(addr, value);
+        self.bus.write(&mut self.ctx, addr, value);
     }
 
-    pub fn get8(&mut self, src: Op8) -> u8 {
+    fn get8(&mut self, src: Op8) -> u8 {
         match src {
             Op8::RegA => self.registers.a,
             Op8::RegB => self.registers.b,
@@ -115,7 +123,7 @@ impl CPU {
         }
     }
 
-    pub fn is_jump_cond_satisfied(&self, cond: JumpCond) -> bool {
+    fn is_jump_cond_satisfied(&self, cond: JumpCond) -> bool {
         match cond {
             JumpCond::NONE => true,
             JumpCond::NZ => !self.registers.get_z_flag(),
@@ -125,14 +133,53 @@ impl CPU {
         }
     }
 
-    pub fn fetch(&mut self) -> u8 {
+    fn fetch(&mut self) -> u8 {
         let value = self.read(self.registers.pc);
         self.registers.pc = self.registers.pc.wrapping_add(1);
         value
     }
 
-    pub fn execute_inst(&mut self) {
-        self.tick_count = 0;
+    fn handle_interrupt(&mut self, interrupt: u8) {
+        for i in 0..5 {
+            if interrupt & (1 << i) != 0 {
+                self.interrupt_master_enable = false;
+                self.ctx.interrupt_flag ^= 1 << i;
+                self.tick();
+                self.tick();
+                self.registers.sp = self.registers.sp.wrapping_sub(2);
+                self.write(self.registers.sp, (self.registers.pc & 0xff) as u8);
+                self.write(
+                    self.registers.sp.wrapping_add(1),
+                    (self.registers.pc >> 8) as u8,
+                );
+                self.tick();
+                self.registers.pc = consts::INTERRUPT_HANDLER[i];
+                break;
+            }
+        }
+    }
+
+    pub fn execute(&mut self) {
+        let interrupt = self.ctx.interrupt_flag & self.ctx.interrupt_enable & 0x1f;
+        if interrupt != 0 {
+            self.is_halt = false;
+            if self.interrupt_master_enable {
+                self.handle_interrupt(interrupt);
+                return;
+            }
+        }
+        if self.is_halt {
+            self.tick();
+            return;
+        }
+        let inst = self.execute_inst();
+        if self.prev_ei {
+            self.interrupt_master_enable = true;
+        }
+        self.prev_ei = matches!(inst, Inst::EI);
+    }
+
+    fn execute_inst(&mut self) -> Inst {
         let opcode = self.fetch() as usize;
         let inst = self.inst_table[opcode];
         match inst {
@@ -163,6 +210,15 @@ impl CPU {
                 let value = self.read(hl);
                 self.registers.a = value;
                 self.registers.set_hl(hl.wrapping_sub(1));
+            }
+            Inst::LD16(Op16::AddrImm, Op16::RegSP) => {
+                let value = self.registers.sp;
+                self.set16(Op16::AddrImm, value);
+            }
+            Inst::LD16(Op16::RegSP, Op16::RegHL) => {
+                self.tick();
+                let value = self.registers.get_hl();
+                self.registers.sp = value;
             }
             Inst::LD16(Op16::RegHL, Op16::AddImmToSP) => {
                 let a = self.registers.sp;
@@ -330,6 +386,7 @@ impl CPU {
                 self.registers.set_h_flag(true);
             }
             Inst::ADDHL(op) => {
+                self.tick();
                 let a = self.registers.get_hl();
                 let b = self.get16(op);
                 let (value, carry) = a.overflowing_add(b);
@@ -418,9 +475,13 @@ impl CPU {
                 self.registers.set_c_flag(true);
             }
             Inst::NOP => {}
-            Inst::HALT => {}
+            Inst::HALT => {
+                self.is_halt = true;
+            }
             Inst::STOP => {}
-            Inst::DI => {}
+            Inst::DI => {
+                self.interrupt_master_enable = false;
+            }
             Inst::EI => {}
             Inst::JP(JumpCond::NONE, Op16::RegHL) => {
                 self.registers.pc = self.registers.get_hl();
@@ -487,15 +548,16 @@ impl CPU {
                 self.registers.pc = addr;
             }
             Inst::PREFIX => {
-                self.execute_prefix_inst();
+                return self.execute_prefix_inst();
             }
             _ => {
                 unreachable!("unknown opcode: {:x}", opcode);
             }
         }
+        inst
     }
 
-    fn execute_prefix_inst(&mut self) {
+    fn execute_prefix_inst(&mut self) -> Inst {
         let opcode = self.fetch() as usize;
         let inst = self.prefix_inst_table[opcode];
         match inst {
@@ -599,13 +661,9 @@ impl CPU {
             }
             _ => unreachable!("unknown opcode: {:x}", opcode),
         }
+        inst
     }
 }
-
-const Z_FLAG: u8 = 1 << 7;
-const N_FLAG: u8 = 1 << 6;
-const H_FLAG: u8 = 1 << 5;
-const C_FLAG: u8 = 1 << 4;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Registers {
@@ -659,50 +717,50 @@ impl Registers {
     }
 
     pub fn get_z_flag(&self) -> bool {
-        (self.f & Z_FLAG) != 0
+        (self.f & consts::Z_FLAG) != 0
     }
 
     pub fn set_z_flag(&mut self, value: bool) {
         if value {
-            self.f |= Z_FLAG;
+            self.f |= consts::Z_FLAG;
         } else {
-            self.f &= 0xff ^ Z_FLAG;
+            self.f &= 0xff ^ consts::Z_FLAG;
         }
     }
 
     pub fn get_n_flag(&self) -> bool {
-        (self.f & N_FLAG) != 0
+        (self.f & consts::N_FLAG) != 0
     }
 
     pub fn set_n_flag(&mut self, value: bool) {
         if value {
-            self.f |= N_FLAG;
+            self.f |= consts::N_FLAG;
         } else {
-            self.f &= 0xff ^ N_FLAG;
+            self.f &= 0xff ^ consts::N_FLAG;
         }
     }
 
     pub fn get_h_flag(&self) -> bool {
-        (self.f & H_FLAG) != 0
+        (self.f & consts::H_FLAG) != 0
     }
 
     pub fn set_h_flag(&mut self, value: bool) {
         if value {
-            self.f |= H_FLAG;
+            self.f |= consts::H_FLAG;
         } else {
-            self.f &= 0xff ^ H_FLAG;
+            self.f &= 0xff ^ consts::H_FLAG;
         }
     }
 
     pub fn get_c_flag(&self) -> bool {
-        (self.f & C_FLAG) != 0
+        (self.f & consts::C_FLAG) != 0
     }
 
     pub fn set_c_flag(&mut self, value: bool) {
         if value {
-            self.f |= C_FLAG;
+            self.f |= consts::C_FLAG;
         } else {
-            self.f &= 0xff ^ C_FLAG;
+            self.f &= 0xff ^ consts::C_FLAG;
         }
     }
 }

@@ -22,7 +22,7 @@ impl Emulator {
 
     pub fn init(&mut self) {
         // https://gbdev.io/pandocs/Power_Up_Sequence.html#cpu-registers
-        self.cpu.registers.a = 0x00;
+        self.cpu.registers.a = 0x01;
         self.cpu.registers.b = 0x00;
         self.cpu.registers.c = 0x13;
         self.cpu.registers.d = 0x00;
@@ -32,6 +32,14 @@ impl Emulator {
         self.cpu.registers.l = 0x4d;
         self.cpu.registers.pc = 0x100;
         self.cpu.registers.sp = 0xfffe;
+
+        self.cpu.bus.timer.div = 0xab;
+        self.cpu.bus.timer.tima = 0x00;
+        self.cpu.bus.timer.tma = 0x00;
+        self.cpu.bus.timer.tac = 0xf8;
+
+        self.cpu.ctx.interrupt_flag = 0xe1;
+        self.cpu.ctx.interrupt_enable = 0x00;
     }
 
     pub fn load_rom(&mut self, rom_data: &[u8]) {
@@ -42,9 +50,16 @@ impl Emulator {
     pub fn next_frame(&mut self) {
         console_error_panic_hook::set_once();
         self.clocks += 17556;
-        while self.clocks > 0 {
-            self.cpu.execute_inst();
-            self.clocks -= self.cpu.tick_count;
+        self.cpu.tick_count = 0;
+        while self.cpu.tick_count < self.clocks {
+            self.cpu.execute();
+        }
+        self.clocks -= self.cpu.tick_count;
+    }
+
+    pub fn step_execute(&mut self, steps: usize) {
+        for _ in 0..steps {
+            self.cpu.execute();
         }
     }
 
